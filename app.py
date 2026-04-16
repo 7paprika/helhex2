@@ -2,7 +2,15 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 import json
-import datetime
+
+from calculator import (
+    INIT_STATE,
+    apply_loaded_data,
+    calculate_design,
+    find_optimal_geometry,
+    format_datasheet_markdown,
+    format_html_report,
+)
 
 st.set_page_config(page_title="Helical Tube Heat Exchanger Designer", layout="wide")
 st.title("플랜트 공정 설계: Helical Tube Heat Exchanger 최적화")
@@ -11,30 +19,7 @@ st.markdown("---")
 # =========================================================
 # [A] 글로벌 상태(Session State) 초기화 (이전 코드 유지)
 # =========================================================
-init_state = {
-    'tag_no': 'HE-101', 
-    'tube_fluid_name': 'Process Slurry',
-    'shell_fluid_name': 'Hot Water / Steam',
-    'fluid_type': "Liquid (뉴턴 유체 - 물, 오일 등)",
-    't_rho': 998.0, 't_cp': 4180.0, 't_k': 0.6, 't_mu': 1.0, 
-    's_rho': 998.0, 's_mu': 1.0, 's_cp': 4180.0, 's_k': 0.6,
-    'rheology_model': "Power-law (멱법칙)",
-    'tau_y': 5.0, 'plastic_visc': 0.05,
-    'consistency_k': 0.1, 'flow_index_n': 0.8,
-    'm_hot': 5000.0, 'm_cold': 8000.0,
-    'T_hot_in': 30.0, 'T_hot_out': 80.0,
-    'T_cold_in': 120.0, 'T_cold_out': 90.0,
-    'allowable_dp_tube': 1.5, 'allowable_dp_shell': 0.5,
-    'N_p': 3, 
-    'd_o': 25.4, 't_thick': 2.11, 'D_c': 400.0, 'pitch': 50.0, 'D_s': 500.0,
-    'shell_thick': 10.0,
-    'D_mandrel': 350.0, 
-    'tube_material': 'Stainless Steel 316 (k=16)', 'tube_k_wall': 16.0,
-    'R_fi': 0.000176, 'R_fo': 0.000176,
-    'overdesign_pct': 10.0,
-    'design_p_shell': 10.0, 'allow_s_shell': 137.9, 'joint_e': 0.85, 'ca_shell': 3.0,
-    'orientation': 'Vertical (수직형)'
-}
+init_state = INIT_STATE.copy()
 
 for k, v in init_state.items():
     if k not in st.session_state:
@@ -46,10 +31,9 @@ def apply_json():
         st.warning("JSON 데이터를 입력하십시오.")
         return
     try:
-        parsed_data = json.loads(json_str)
-        for k in init_state.keys():
-            if k in parsed_data:
-                st.session_state[k] = parsed_data[k]
+        parsed_data = apply_loaded_data(json_str)
+        for k, v in parsed_data.items():
+            st.session_state[k] = v
         st.success(f"✅ 설계 데이터(Tag: {st.session_state.get('tag_no')}) 로드 완료.")
     except Exception as e:
         st.error(f"🚨 데이터 로드 실패: {e}")
@@ -239,8 +223,9 @@ with col_g2:
     except ValueError: mat_idx = len(mat_keys) - 1
 
     selected_mat = st.selectbox("Tube Material", mat_keys, index=mat_idx)
+    st.session_state['tube_material'] = selected_mat
     if "Custom" in selected_mat:
-        st.session_state['tube_k_wall'] = st.number_input("열전도도 입력", value=float(curr_k))
+        st.session_state['tube_k_wall'] = st.number_input("열전도도 입력", value=float(curr_k), min_value=0.01)
     else:
         st.session_state['tube_k_wall'] = mat_dict[selected_mat]
 
@@ -341,156 +326,104 @@ with cc3:
 with cc4:
     st.number_input("부식 여유 (C.A., mm)", step=0.5, key='ca_shell', help="탄소강 기본 3.0mm")
 
+current_inputs = {k: st.session_state[k] for k in init_state.keys()}
+calc_result = calculate_design(current_inputs)
+calc = calc_result.values
+for error in calc_result.errors:
+    st.error(f"🚨 {error}")
+for warning in calc_result.warnings:
+    st.warning(f"⚠️ {warning}")
+
 P_mpa = st.session_state['design_p_shell'] / 10.0
 R_mm = st.session_state['D_s'] / 2.0
 S_mpa = st.session_state['allow_s_shell']
 E_eff = st.session_state['joint_e']
 C_A = st.session_state['ca_shell']
 
-t_req = (P_mpa * R_mm) / (S_mpa * E_eff - 0.6 * P_mpa) + C_A
-t_final = max(6.0, np.ceil(t_req))
+d_i = calc.get('d_i', st.session_state['d_o'] - 2 * st.session_state['t_thick'])
+t_req = calc.get('t_req', 0.0)
+t_final = calc.get('t_final', st.session_state['shell_thick'])
 st.session_state['shell_thick'] = t_final
-shell_od = st.session_state['D_s'] + 2.0 * t_final
+shell_od = calc.get('shell_od', st.session_state['D_s'] + 2.0 * t_final)
 
-st.info(f"✓ 상업용 Shell Thickness: **{t_final:.0f} mm** 확정 (ASME 이론 두께: {t_req:.2f} mm)")
+if calc_result.is_valid:
+    st.info(f"✓ 상업용 Shell Thickness: **{t_final:.0f} mm** 확정 (ASME 이론 두께: {t_req:.2f} mm)")
+else:
+    st.info("입력 검증 오류가 해소되면 두께/수력학 계산이 자동으로 갱신됩니다.")
 
 # =========================================================
-# [G] 백그라운드 수력학/열역학 코어 연산 (이전 코드 유지)
+# [G] 백그라운드 수력학/열역학 코어 연산 (검증/순수 함수 기반)
 # =========================================================
 t_mu_pa = st.session_state.get('t_mu', 1.0) / 1000.0
 s_mu_pa = st.session_state.get('s_mu', 1.0) / 1000.0
-curvature_ratio = d_i / st.session_state['D_c'] if st.session_state['D_c'] > 0 else 0
-
-m_hot_per_tube = (m_t / 3600.0) / max(1, st.session_state['N_p'])
-A_c = np.pi * ((d_i / 1000.0) ** 2) / 4.0 if d_i > 0 else 1e-6
-v_tube = m_hot_per_tube / (st.session_state['t_rho'] * A_c)
-
-if "Liquid" in st.session_state['fluid_type']:
-    Re = (st.session_state['t_rho'] * v_tube * (max(1e-6, d_i) / 1000.0)) / max(1e-6, t_mu_pa)
-    Pr = (st.session_state['t_cp'] * t_mu_pa) / max(1e-6, st.session_state['t_k'])
-    De = Re * np.sqrt(max(0, curvature_ratio))
-    Re_crit = 2100 * (1.0 + 12.0 * np.sqrt(max(0, curvature_ratio)))
-    f_c = (64.0 / max(Re, 1.0) * (1.0 + 0.033 * (np.log10(max(De, 1.0)))**4.0)) if Re < Re_crit else (0.304 / (max(Re, 1.0) ** 0.25) + 0.029 * np.sqrt(max(0, curvature_ratio)))
-    Nu_straight = 4.36 if Re < Re_crit else 0.023 * (max(Re, 1.0) ** 0.8) * (Pr ** 0.4)
-else:
-    n_val = st.session_state['flow_index_n'] if "Power" in st.session_state['rheology_model'] else 1.0
-    K_val = st.session_state['consistency_k'] if "Power" in st.session_state['rheology_model'] else st.session_state['plastic_visc']
-    D_m_tube = max(1e-6, d_i) / 1000.0
-    term1 = st.session_state['t_rho'] * (v_tube ** (2.0 - n_val)) * (D_m_tube ** n_val)
-    term2 = (8.0 ** (n_val - 1.0)) * max(K_val, 0.0001) * (((3.0 * n_val + 1.0) / (4.0 * n_val)) ** n_val)
-    Re = term1 / term2 if term2 > 0 else 0.0
-    mu_app = term1 / (Re * v_tube) if (Re * v_tube) > 0 else 0.001
-    Pr = (st.session_state['t_cp'] * mu_app) / max(1e-6, st.session_state['t_k'])
-    De = Re * np.sqrt(max(0, curvature_ratio))
-    Re_crit = 2100 * (1.0 + 12.0 * np.sqrt(max(0, curvature_ratio)))
-    f_c = (64.0 / max(Re, 1.0) * (1.0 + 0.033 * (np.log10(max(De, 1.0)))**4.0)) if Re < Re_crit else (0.304 / (max(Re, 1.0) ** 0.25) + 0.029 * np.sqrt(max(0, curvature_ratio)))
-    Nu_straight = 4.36 if Re < Re_crit else 0.023 * (max(Re, 1.0) ** 0.8) * (Pr ** 0.4)
-
-Nu_calc = Nu_straight * (1.0 + 3.5 * curvature_ratio)
-h_i = (Nu_calc * st.session_state['t_k']) / (max(1e-6, d_i) / 1000.0)
-
-m_cold_kg_s = m_s / 3600.0
-D_s_m = st.session_state['D_s'] / 1000.0
-D_man_m = st.session_state['D_mandrel'] / 1000.0
-d_o_m = st.session_state['d_o'] / 1000.0
-
-N_p_val = max(1, st.session_state['N_p'])
-p_m = st.session_state['pitch'] / 1000.0
-D_c_m = st.session_state['D_c'] / 1000.0
-Lead_m = p_m * N_p_val
-Length_per_Turn = np.sqrt((np.pi * D_c_m)**2 + Lead_m**2) if D_c_m > 0 else 1.0
-
-A_annulus = (np.pi / 4.0) * (D_s_m**2 - D_man_m**2)
+curvature_ratio = calc.get('curvature_ratio', 0.0)
+m_hot_per_tube = calc.get('m_hot_per_tube', 0.0)
+A_c = calc.get('A_c', 1e-6)
+v_tube = calc.get('v_tube', 0.0)
+Re = calc.get('Re', 0.0)
+Pr = calc.get('Pr', 0.0)
+De = calc.get('De', 0.0)
+Re_crit = calc.get('Re_crit', 0.0)
+f_c = calc.get('f_c', 0.0)
+Nu_straight = calc.get('Nu_straight', 0.0)
+Nu_calc = calc.get('Nu_calc', 0.0)
+h_i = calc.get('h_i', 0.0)
+m_cold_kg_s = calc.get('m_cold_kg_s', m_s / 3600.0)
+D_s_m = calc.get('D_s_m', st.session_state['D_s'] / 1000.0)
+D_man_m = calc.get('D_man_m', st.session_state['D_mandrel'] / 1000.0)
+d_o_m = calc.get('d_o_m', st.session_state['d_o'] / 1000.0)
+N_p_val = calc.get('N_p_val', max(1, st.session_state['N_p']))
+p_m = calc.get('p_m', st.session_state['pitch'] / 1000.0)
+D_c_m = calc.get('D_c_m', st.session_state['D_c'] / 1000.0)
+Lead_m = calc.get('Lead_m', p_m * N_p_val)
+Length_per_Turn = calc.get('Length_per_Turn', 1.0)
+A_annulus = calc.get('A_annulus', 0.0)
 A_tube_cross = (np.pi / 4.0) * (d_o_m**2)
-A_blocked = N_p_val * A_tube_cross * (Length_per_Turn / max(1e-6, Lead_m))
-A_free_flow = max(A_annulus * 0.1, A_annulus - A_blocked)
-
-v_shell = m_cold_kg_s / (st.session_state['s_rho'] * A_free_flow) if A_free_flow > 0 else 0.0
-
-D_e_shell = D_s_m - D_man_m
-Re_shell = (st.session_state['s_rho'] * v_shell * D_e_shell) / max(1e-6, s_mu_pa)
-Pr_shell = (st.session_state['s_cp'] * s_mu_pa) / max(1e-6, st.session_state['s_k'])
-Nu_shell = 0.33 * (max(Re_shell, 1.0) ** 0.6) * (Pr_shell ** 0.33)
-h_o = (Nu_shell * st.session_state['s_k']) / max(1e-6, d_o_m)
-
-pitch_ratio = st.session_state['pitch'] / max(1e-6, st.session_state['d_o'])
-penalty_factor = 1.0
-if pitch_ratio < 1.25:
-    penalty_factor = max(0.5, 1.0 - 2.0 * (1.25 - pitch_ratio)) 
-h_o = h_o * penalty_factor
-
-R_wall = (d_o_m * np.log(st.session_state['d_o'] / max(1e-6, d_i))) / (2.0 * max(1e-6, st.session_state['tube_k_wall'])) if d_i > 0 else 0
-U_calc = 1.0 / ((1.0 / max(h_o, 0.1)) + st.session_state['R_fo'] + R_wall + st.session_state['R_fi'] * (st.session_state['d_o'] / max(1e-6, d_i)) + (st.session_state['d_o'] / max(1e-6, d_i)) * (1.0 / max(h_i, 0.1)))
-
-Area_req = (Q_kW * 1000.0) / (U_calc * LMTD) if not lmtd_error else 0.0
-Area_design = Area_req * (1.0 + st.session_state['overdesign_pct'] / 100.0)
-
-Total_Tube_Length = Area_design / (np.pi * d_o_m) if d_o_m > 0 else 0.0
-Length_per_Tube = Total_Tube_Length / N_p_val
-Turns_per_Tube = Length_per_Tube / Length_per_Turn
-
-dp_tube_bar = (f_c * (Length_per_Tube / (max(1e-6, d_i) / 1000.0)) * (st.session_state['t_rho'] * (v_tube ** 2) / 2.0)) / 100000.0
-
-L_shell_m = Turns_per_Tube * Lead_m
-L_shell_mm = L_shell_m * 1000.0
-f_s = 0.316 / (max(Re_shell, 1.0)**0.25) 
-dp_shell_bar = (f_s * (L_shell_m / max(1e-6, D_e_shell)) * (st.session_state['s_rho'] * (v_shell ** 2) / 2.0)) / 100000.0
+A_blocked = calc.get('A_blocked', 0.0)
+A_free_flow = calc.get('A_free_flow', 0.0)
+v_shell = calc.get('v_shell', 0.0)
+D_e_shell = calc.get('D_e_shell', 0.0)
+Re_shell = calc.get('Re_shell', 0.0)
+Pr_shell = calc.get('Pr_shell', 0.0)
+Nu_shell = calc.get('Nu_shell', 0.0)
+h_o = calc.get('h_o', 0.0)
+pitch_ratio = calc.get('pitch_ratio', st.session_state['pitch'] / max(1e-6, st.session_state['d_o']))
+penalty_factor = calc.get('penalty_factor', 1.0)
+R_wall = calc.get('R_wall', 0.0)
+U_calc = calc.get('U_calc', 0.0)
+Area_req = calc.get('Area_req', 0.0)
+Area_design = calc.get('Area_design', 0.0)
+Total_Tube_Length = calc.get('Total_Tube_Length', 0.0)
+Length_per_Tube = calc.get('Length_per_Tube', 0.0)
+Turns_per_Tube = calc.get('Turns_per_Tube', 0.0)
+dp_tube_bar = calc.get('dp_tube_bar', 0.0)
+L_shell_m = calc.get('L_shell_m', 0.0)
+L_shell_mm = calc.get('L_shell_mm', 0.0)
+f_s = calc.get('f_s', 0.0)
+dp_shell_bar = calc.get('dp_shell_bar', 0.0)
+inner_clearance_rad = calc.get('inner_clearance_rad', ((st.session_state['D_c'] - st.session_state['d_o']) - st.session_state['D_mandrel']) / 2.0)
+outer_clearance_rad = calc.get('outer_clearance_rad', (st.session_state['D_s'] - (st.session_state['D_c'] + st.session_state['d_o'])) / 2.0)
 
 # =========================================================
 # [H] AI 최적화 제안 (Optimizer) (이전 코드 유지)
 # =========================================================
-opt_best_Dc = None
-opt_min_LTT = float('inf')
-opt_best_Dm = None
-opt_best_Ds = None
-opt_p_m = (st.session_state['d_o'] * 1.25) / 1000.0
-opt_Lead_m = opt_p_m * N_p_val
-
-for t_Dc in np.arange(st.session_state['d_o'] * 10.0, 3000.0, 10.0):
-    t_Dc_m = t_Dc / 1000.0
-    t_Dm = max(10.0, t_Dc - st.session_state['d_o'] - 10.0)
-    t_Dm_m = t_Dm / 1000.0
-    t_Ds = t_Dc + st.session_state['d_o'] + 40.0
-    t_Ds_m = t_Ds / 1000.0
-
-    t_A_annulus = (np.pi / 4.0) * (t_Ds_m**2 - t_Dm_m**2)
-    t_Length_per_Turn = np.sqrt((np.pi * t_Dc_m)**2 + opt_Lead_m**2) if t_Dc_m > 0 else 1.0
-    t_A_blocked = N_p_val * ((np.pi / 4.0) * (d_o_m**2)) * (t_Length_per_Turn / max(1e-6, opt_Lead_m))
-    t_A_free = max(t_A_annulus * 0.1, t_A_annulus - t_A_blocked)
-
-    t_v_shell = m_cold_kg_s / (st.session_state['s_rho'] * t_A_free) if t_A_free > 0 else 0.0
-    t_Re_shell = (st.session_state['s_rho'] * t_v_shell * (t_Ds_m - t_Dm_m)) / max(1e-6, s_mu_pa)
-    t_ho = ((0.33 * (max(t_Re_shell, 1.0) ** 0.6) * (Pr_shell ** 0.33)) * st.session_state['s_k']) / max(1e-6, d_o_m)
-    
-    t_cr = d_i / t_Dc if t_Dc > 0 else 0
-    t_hi = ((Nu_straight * (1.0 + 3.5 * t_cr)) * st.session_state['t_k']) / (max(1e-6, d_i) / 1000.0)
-    
-    t_U = 1.0 / ((1.0 / max(t_ho, 0.1)) + st.session_state['R_fo'] + R_wall + st.session_state['R_fi'] * (st.session_state['d_o'] / max(1e-6, d_i)) + (st.session_state['d_o'] / max(1e-6, d_i)) * (1.0 / max(t_hi, 0.1)))
-    t_Area_req = (Q_kW * 1000.0) / (t_U * LMTD) if not lmtd_error else 0.0
-    t_Area_design = t_Area_req * (1.0 + st.session_state['overdesign_pct'] / 100.0)
-    
-    t_Turns = (t_Area_design / (np.pi * d_o_m * N_p_val)) / (np.sqrt((np.pi * t_Dc_m)**2 + opt_Lead_m**2) if t_Dc_m > 0 else 1.0)
-    t_L_shell_m = t_Turns * opt_Lead_m
-    t_L_TT = t_L_shell_m + (2.0 * t_Ds_m)
-    
-    if t_Dc_m < t_L_TT: 
-        if t_L_TT < opt_min_LTT:
-            opt_min_LTT = t_L_TT
-            opt_best_Dc = t_Dc
-            opt_best_Dm = t_Dm
-            opt_best_Ds = t_Ds
+opt_results = find_optimal_geometry(current_inputs, calc) if calc_result.is_valid else {"opt_best_Dc": None, "opt_min_LTT": None, "opt_best_Dm": None, "opt_best_Ds": None}
+opt_best_Dc = opt_results["opt_best_Dc"]
+opt_min_LTT = opt_results["opt_min_LTT"]
+opt_best_Dm = opt_results["opt_best_Dm"]
+opt_best_Ds = opt_results["opt_best_Ds"]
 
 # =========================================================
 # [I] 실시간 Bounding Box 렌더링 (이전 코드 유지)
 # =========================================================
-Shell_TT_Length_m = L_shell_m + (2.0 * D_s_m) 
-Shell_TT_Length_mm = Shell_TT_Length_m * 1000.0
+Shell_TT_Length_m = calc.get('Shell_TT_Length_m', L_shell_m + (2.0 * D_s_m))
+Shell_TT_Length_mm = calc.get('Shell_TT_Length_mm', Shell_TT_Length_m * 1000.0)
 shell_od_m = shell_od / 1000.0
 
 if "Vertical" in st.session_state['orientation']:
-    Footprint_Area = (np.pi / 4.0) * (shell_od_m ** 2)
+    Footprint_Area = calc.get('Footprint_Area', (np.pi / 4.0) * (shell_od_m ** 2))
 else:
-    Footprint_Area = shell_od_m * Shell_TT_Length_m
+    Footprint_Area = calc.get('Footprint_Area', shell_od_m * Shell_TT_Length_m)
 
 with bbox_placeholder.container():
     st.markdown("#### 📐 실시간 장비 예상 규격 (Estimated Bounding Box)")
@@ -512,7 +445,7 @@ with bbox_placeholder.container():
 # =========================================================
 st.markdown("---")
 st.subheader("5. 열전달 및 수력학 검증 (Datasheet & Report)")
-st.caption(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Generated on: {calc.get('generated_at', 'N/A')}")
 
 with st.expander("💡 설계 유속(Velocity) 가이드라인 및 판정 기준"):
     st.markdown("""
@@ -522,113 +455,20 @@ with st.expander("💡 설계 유속(Velocity) 가이드라인 및 판정 기준
     | **Shell 측 (액체)** | 0.3 ~ 1.0 m/s | **< 0.2:** 열전달 사각지대 발생 <br> **> 1.5:** 유체 유발 진동(FIV)으로 코일 파손 |
     """)
 
-if penalty_factor < 1.0:
-    st.warning(f"⚠️ **코일 밀착 페널티 적용됨:** Pitch가 기준치(1.25*OD)보다 작아 코일 틈새 사각지대 현상을 반영했습니다. Shell 측 열전달 계수(h_o)가 {(1.0-penalty_factor)*100:.0f}% 삭감되었습니다.")
-
-datasheet_md = f"""
-| **Item Tag No.** | **{st.session_state['tag_no']}** | **Type** | Helical Coil Heat Exchanger |
-| :--- | :--- | :--- | :--- |
-| **Performance Data** | | | |
-| Heat Duty (kW) | {Q_kW:,.2f} | Overall U-value (W/m²K) | {U_calc:,.1f} |
-| Req. Area / Design Area | {Area_req:,.2f} m² / **{Area_design:,.2f} m²** (+{st.session_state['overdesign_pct']}%) | LMTD (°C) | {LMTD:,.1f} |
-| **Process Conditions** | **Tube Side (Inner)** | **Shell Side (Outer)** | |
-| Fluid Name | **{st.session_state['tube_fluid_name']}** | **{st.session_state['shell_fluid_name']}** | |
-| Total Flow Rate (kg/h) | {st.session_state['m_hot']:,.0f} | {st.session_state['m_cold']:,.0f} | |
-| Temp. In / Out (°C) | {st.session_state['T_hot_in']} / {st.session_state['T_hot_out']} | {st.session_state['T_cold_in']} / {st.session_state['T_cold_out']} | |
-| Velocity (m/s) | **{v_tube:.2f}** | **{v_shell:.2f}** | |
-| Calc. Press. Drop (bar)| **{dp_tube_bar:.3f}** (Allow: {st.session_state['allowable_dp_tube']}) | **{dp_shell_bar:.3f}** (Allow: {st.session_state['allowable_dp_shell']}) | |
-| **Mechanical Design** | | | |
-| **[Tube]** OD x Thick. (mm) | {st.session_state['d_o']} x {st.session_state['t_thick']} | **[Tube]** Material | {st.session_state['tube_material']} |
-| **[Tube]** Parallel Coils (N_p)| **{st.session_state['N_p']} ea** | **[Tube]** Length per Tube | {Length_per_Tube:,.1f} m |
-| **[Coil]** Center Dia. (D_c) | {st.session_state['D_c']} mm | **[Coil]** Pitch (Gap) | {st.session_state['pitch']} mm |
-| **[Coil]** Turns per Tube | {Turns_per_Tube:,.1f} turns | **[Install]** Orientation | {st.session_state['orientation']} |
-| **[Shell]** ID / Mandrel OD | {st.session_state['D_s']} mm / {st.session_state['D_mandrel']} mm | **[Shell]** OD x Thick. (mm) | **{shell_od:.1f} x {st.session_state['shell_thick']:.0f}** |
-| **[Shell]** T/T Length (mm) | **{Shell_TT_Length_mm:,.0f} mm** | | |
-"""
+datasheet_md = format_datasheet_markdown(current_inputs, calc) if calc_result.is_valid else "설계 입력값을 수정하면 데이터시트가 생성됩니다."
 st.markdown(datasheet_md)
 
-html_report = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>{st.session_state['tag_no']} - Heat Exchanger Datasheet</title>
-    <style>
-        body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; line-height: 1.6; margin: 20px; }}
-        .header {{ text-align: center; border-bottom: 3px solid #004488; padding-bottom: 10px; margin-bottom: 30px; }}
-        h2 {{ margin: 0; color: #004488; font-size: 24px; }}
-        .meta-info {{ font-size: 12px; color: #666; text-align: right; }}
-        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; }}
-        th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
-        th {{ background-color: #f4f7f6; font-weight: bold; color: #333; }}
-        .section-title {{ background-color: #004488; color: white; padding: 6px 12px; font-size: 14px; font-weight: bold; }}
-        @media print {{
-            body {{ margin: 0; padding: 20px; }}
-            .no-print {{ display: none; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="no-print" style="background-color: #fff3cd; padding: 10px; border: 1px solid #ffeeba; margin-bottom: 20px; font-size: 14px;">
-        💡 <b>엔지니어 가이드:</b> 완벽한 PDF를 얻으려면 <code>Ctrl + P</code> (인쇄)를 누른 뒤, 대상을 <b>'PDF로 저장'</b>으로 변경하십시오.
-    </div>
-    
-    <div class="header">
-        <h2>COMMERCIAL DATASHEET</h2>
-        <p style="margin:5px 0; font-weight:bold;">Helical Coil Heat Exchanger</p>
-    </div>
-    
-    <div class="meta-info">Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
-    
-    <table>
-        <tr><td class="section-title" colspan="4">1. General Information</td></tr>
-        <tr><th>Item Tag No.</th><td><b>{st.session_state['tag_no']}</b></td><th>Overall U-value</th><td>{U_calc:,.1f} W/m²K</td></tr>
-        <tr><th>Heat Duty</th><td>{Q_kW:,.2f} kW</td><th>Req. / Design Area</th><td>{Area_req:,.2f} / <b>{Area_design:,.2f} m²</b> (+{st.session_state['overdesign_pct']}%)</td></tr>
-        <tr><th>LMTD</th><td>{LMTD:,.1f} &deg;C</td><th>Operation Mode</th><td>{op_mode}</td></tr>
-        
-        <tr><td class="section-title" colspan="4">2. Process Conditions</td></tr>
-        <tr><th>Parameter</th><th colspan="1">Tube Side (Inner)</th><th colspan="2">Shell Side (Outer)</th></tr>
-        <tr><td>Fluid Name</td><td colspan="1">{st.session_state['tube_fluid_name']}</td><td colspan="2">{st.session_state['shell_fluid_name']}</td></tr>
-        <tr><td>Flow Rate (kg/h)</td><td colspan="1">{st.session_state['m_hot']:,.0f}</td><td colspan="2">{st.session_state['m_cold']:,.0f}</td></tr>
-        <tr><td>Temp. In / Out (&deg;C)</td><td colspan="1">{st.session_state['T_hot_in']} / {st.session_state['T_hot_out']}</td><td colspan="2">{st.session_state['T_cold_in']} / {st.session_state['T_cold_out']}</td></tr>
-        <tr><td>Velocity (m/s)</td><td colspan="1">{v_tube:.2f}</td><td colspan="2">{v_shell:.2f}</td></tr>
-        <tr><td>Pressure Drop (bar)</td><td colspan="1"><b>{dp_tube_bar:.3f}</b> (Allow: {st.session_state['allowable_dp_tube']})</td><td colspan="2"><b>{dp_shell_bar:.3f}</b> (Allow: {st.session_state['allowable_dp_shell']})</td></tr>
-        <tr><td>Fouling Factor</td><td colspan="1">{st.session_state['R_fi']:.6f}</td><td colspan="2">{st.session_state['R_fo']:.6f}</td></tr>
-        
-        <tr><td class="section-title" colspan="4">3. Mechanical Design (ASME Sec.VIII)</td></tr>
-        <tr><th>[Tube] OD x Thick. (mm)</th><td>{st.session_state['d_o']} x {st.session_state['t_thick']}</td><th>[Tube] Material</th><td>{st.session_state['tube_material']}</td></tr>
-        <tr><th>[Tube] Parallel Coils (N_p)</th><td>{st.session_state['N_p']} ea</td><th>[Tube] Length per Tube</th><td>{Length_per_Tube:,.1f} m</td></tr>
-        <tr><th>[Coil] Center Dia. (D_c)</th><td>{st.session_state['D_c']} mm</td><th>[Coil] Pitch (Gap)</th><td>{st.session_state['pitch']} mm</td></tr>
-        <tr><th>[Coil] Turns per Tube</th><td>{Turns_per_Tube:,.1f} turns</td><th>[Install] Orientation</th><td>{st.session_state['orientation']}</td></tr>
-        <tr><th>[Shell] ID / Mandrel OD</th><td>{st.session_state['D_s']} mm / {st.session_state['D_mandrel']} mm</td><th>[Shell] OD x Thick. (mm)</th><td>{shell_od:.1f} x {st.session_state['shell_thick']:.0f}</td></tr>
-        <tr><th>[Shell] T/T Length (mm)</th><td colspan="3" style="font-size:16px;"><b>{Shell_TT_Length_mm:,.0f} mm</b></td></tr>
-    </table>
-</body>
-</html>
-"""
+html_report = format_html_report(current_inputs, calc, calc_result.warnings) if calc_result.is_valid else "<html><body><p>설계 입력값을 수정하면 보고서가 생성됩니다.</p></body></html>"
 
 col_dl1, col_dl2 = st.columns([1, 2])
 with col_dl1:
-    st.download_button(label="📄 Datasheet 다운로드 (HTML/PDF용)", data=html_report, file_name=f"{st.session_state['tag_no']}_Datasheet.html", mime="text/html")
+    st.download_button(label="📄 Datasheet 다운로드 (HTML/PDF용)", data=html_report, file_name=f"{st.session_state['tag_no']}_Datasheet.html", mime="text/html", disabled=not calc_result.is_valid)
 with col_dl2:
     st.info("💡 폰트 에러 없는 PDF 출력을 위해 HTML로 내보냅니다. 브라우저 인쇄(Ctrl+P) 기능을 활용하세요.")
 
-err_msg = []
-if lmtd_error: err_msg.append("Temperature Cross (온도 역전) 발생")
-if inner_clearance_rad < 0: err_msg.append("Mandrel - Coil 내측 간섭 발생")
-if outer_clearance_rad < 0: err_msg.append("Shell - Coil 외측 간섭 발생")
-if dp_tube_bar > st.session_state['allowable_dp_tube']: err_msg.append(f"Tube 측 ΔP 초과")
-if dp_shell_bar > st.session_state['allowable_dp_shell']: err_msg.append(f"Shell 측 ΔP 초과")
-if Shell_TT_Length_m > 10.0: err_msg.append(f"장비 총 길이 10m 초과 (레이아웃 한계)")
-if d_i <= 0: err_msg.append("내경(ID) 계산 불가")
-
-if v_tube < 1.0: err_msg.append("Tube 유속 저하 (오염/침전 위험)")
-if v_tube > 3.0: err_msg.append("Tube 유속 초과 (침식 위험)")
-if v_shell < 0.2: err_msg.append("Shell 유속 저하 (열전달 사각지대 위험)")
-if v_shell > 1.5: err_msg.append("Shell 유속 초과 (진동/파손 위험)")
-
-if err_msg:
-    st.error("🚨 **Datasheet Warning:** " + " / ".join(err_msg))
+all_messages = calc_result.errors + calc_result.warnings
+if all_messages:
+    st.error("🚨 **Datasheet Review Required:** " + " / ".join(all_messages))
 else:
     st.success("✅ **Datasheet Validated:** 모든 공정, 수력학, 기계적 제약 조건을 통과했습니다.")
 
@@ -638,7 +478,7 @@ else:
 st.markdown("---")
 st.subheader("6. 3D 코일 형상 (Schematic Representation)")
 
-if Turns_per_Tube > 0 and Turns_per_Tube < 2000 and d_i > 0 and not lmtd_error:
+if calc_result.is_valid and Turns_per_Tube > 0 and Turns_per_Tube < 2000 and d_i > 0:
     fig = go.Figure()
     
     t_max_full = Turns_per_Tube * 2 * np.pi
