@@ -73,53 +73,41 @@ EPSILON = 1e-6
 # =========================================================
 def safe_div(numerator, denominator, min_denom=EPSILON):
     """Division by zero 방어 유틸리티"""
-    if abs(denominator) < min_denom:
-        denominator = min_denom if denominator >= 0 else -min_denom
-    return numerator / denominator
+    return numerator / max(min_denom, abs(denominator))
 
 
-def calc_tube_side(Re, Pr, curvature_ratio, d_i_m, t_k, v_tube, rho, L_tube, d_o, d_i, fluid_model="newtonian"):
+def calc_tube_side(Re, Pr, curvature_ratio, d_i_m, t_k, v_tube, rho, L_tube, d_o, d_i):
     """Tube 측 열전달 계수(h_i), 마찰계수(f_c), 압력손실(dp_bar) 통합 계산
     
     Returns:
         dict: h_i, Nu, f_c, dp_bar, Re_crit, De, flow_regime
     """
-    if fluid_model == "newtonian":
-        De = Re * np.sqrt(max(0, curvature_ratio))
-        Re_crit = RE_CRIT_BASE * (1.0 + RE_CRIT_CURVATURE_COEFF * np.sqrt(max(0, curvature_ratio)))
-    else:
-        De = 0.0
-        Re_crit = RE_CRIT_BASE
-
+    De = Re * np.sqrt(max(0, curvature_ratio))
+    Re_crit = RE_CRIT_BASE * (1.0 + RE_CRIT_CURVATURE_COEFF * np.sqrt(max(0, curvature_ratio)))
+    
     is_laminar = Re < Re_crit
     
-    if fluid_model == "newtonian":
-        if is_laminar:
-            # Ito correlation (laminar helical)
-            f_c = (64.0 / max(Re, 1.0)) * (1.0 + FRICTION_LAMINAR_LOG_COEFF * (np.log10(max(De, 1.0)))**4.0)
-            Nu_straight = NU_LAMINAR_CONST
-        else:
-            # Mishra-Gupta correlation (turbulent helical)
-            f_straight = FRICTION_TURBULENT_A / (max(Re, 1.0) ** FRICTION_TURBULENT_EXP)
-            f_c = f_straight + FRICTION_TURBULENT_B * np.sqrt(max(0, curvature_ratio))
-            Nu_straight = NU_TURBULENT_COEFF * (max(Re, 1.0) ** NU_TURBULENT_RE_EXP) * (Pr ** NU_TURBULENT_PR_EXP)
-        Nu = Nu_straight * (1.0 + CURVATURE_NU_FACTOR * curvature_ratio)
+    if is_laminar:
+        # Ito correlation (laminar helical)
+        f_straight = 64.0 / max(Re, 1.0)
+        f_c = f_straight * (1.0 + FRICTION_LAMINAR_LOG_COEFF * (np.log10(max(De, 1.0)))**4.0)
+        Nu_straight = NU_LAMINAR_CONST
     else:
-        if is_laminar:
-            f_c = 64.0 / max(Re, 1.0)
-            Nu = NU_LAMINAR_CONST
-        else:
-            f_c = FRICTION_TURBULENT_A / (max(Re, 1.0) ** FRICTION_TURBULENT_EXP)
-            Nu = NU_TURBULENT_COEFF * (max(Re, 1.0) ** NU_TURBULENT_RE_EXP) * (Pr ** NU_TURBULENT_PR_EXP)
+        # Mishra-Gupta correlation (turbulent helical)
+        f_straight = FRICTION_TURBULENT_A / (max(Re, 1.0) ** FRICTION_TURBULENT_EXP)
+        f_c = f_straight + FRICTION_TURBULENT_B * np.sqrt(max(0, curvature_ratio))
+        Nu_straight = NU_TURBULENT_COEFF * (max(Re, 1.0) ** NU_TURBULENT_RE_EXP) * (Pr ** NU_TURBULENT_PR_EXP)
     
-    # Heat-transfer coefficient
+    # Coil curvature Nu enhancement
+    Nu = Nu_straight * (1.0 + CURVATURE_NU_FACTOR * curvature_ratio)
     h_i = (Nu * t_k) / max(d_i_m, EPSILON)
     
-    # Pressure drop (직관 마찰 + Dean Effect 보정)
-    dean_factor = 1.0
-    dp_bar = (f_c * (L_tube / max(d_i_m, EPSILON)) * (rho * v_tube**2 / 2.0)) / 100000.0
+    # Dean Effect factor for KPI
+    dean_factor = f_c / f_straight if f_straight > 0 else 1.0
     
-    # Dean Effect 추가 압력 손실 (Mishra-Gupta correlation)
+    # Pressure drop (Helical friction factor 적용)
+    dp_coil = f_c * (L_tube / max(d_i_m, EPSILON)) * (rho * v_tube**2 / 2.0)
+    dp_bar = dp_coil / 100000.0
     
     return {
         'h_i': h_i, 'Nu': Nu, 'f_c': f_c, 'dp_bar': dp_bar,
@@ -531,11 +519,9 @@ A_c = np.pi * ((d_i / 1000.0) ** 2) / 4.0 if d_i > 0 else EPSILON
 v_tube = m_hot_per_tube / (st.session_state['t_rho'] * A_c)
 
 if "Liquid" in st.session_state['fluid_type']:
-    tube_flow_model = "newtonian"
     Re = (st.session_state['t_rho'] * v_tube * (max(EPSILON, d_i) / 1000.0)) / max(EPSILON, t_mu_pa)
     Pr = (st.session_state['t_cp'] * t_mu_pa) / max(EPSILON, st.session_state['t_k'])
 else:
-    tube_flow_model = "non_newtonian"
     n_val = st.session_state['flow_index_n'] if "Power" in st.session_state['rheology_model'] else 1.0
     K_val = st.session_state['consistency_k'] if "Power" in st.session_state['rheology_model'] else st.session_state['plastic_visc']
     D_m_tube = max(EPSILON, d_i) / 1000.0
@@ -579,11 +565,7 @@ penalty_factor = shell_result['penalty_factor']
 R_wall = (d_o_m * np.log(st.session_state['d_o'] / max(EPSILON, d_i))) / (2.0 * max(EPSILON, st.session_state['tube_k_wall'])) if d_i > 0 else 0
 
 # Tube 측 h_i (Dean factor는 dp 전용이므로 우선 Nu 계산)
-tube_result_pre = calc_tube_side(
-    Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube,
-    st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i,
-    fluid_model=tube_flow_model
-)
+tube_result_pre = calc_tube_side(Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube, st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i)
 h_i = tube_result_pre['h_i']
 
 # 총괄 U 계산
@@ -599,16 +581,10 @@ Turns_per_Tube = Length_per_Tube / Length_per_Turn
 
 # 정확한 L_tube로 Tube 측 dp 재계산
 tube_result = calc_tube_side(Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube, st.session_state['t_rho'], Length_per_Tube, st.session_state['d_o'], d_i)
-tube_result = calc_tube_side(
-    Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube,
-    st.session_state['t_rho'], Length_per_Tube, st.session_state['d_o'], d_i,
-    fluid_model=tube_flow_model
-)
 dp_tube_bar = tube_result['dp_bar']
 
 L_shell_m = Turns_per_Tube * Lead_m
 L_shell_mm = L_shell_m * 1000.0
-"""
 # Shell ΔP: Zukauskas tube bank crossflow correlation
 # Eu (Euler number per row) ≈ C × Re^n, then ΔP = Eu × N_rows × ρv²/2
 _N_rows_shell = max(1, Turns_per_Tube * N_p_val)  # 유효 tube row 수
@@ -616,13 +592,6 @@ if Re_shell < SHELL_RE_TRANSITION:
     _Eu_per_row = 10.0 / max(Re_shell, 1.0)**0.5  # 층류: Eu ∝ Re^-0.5
 else:
     _Eu_per_row = 1.0 / max(Re_shell, 1.0)**0.2   # 난류: Eu ∝ Re^-0.2
-dp_shell_bar = (_Eu_per_row * _N_rows_shell * st.session_state['s_rho'] * v_shell**2 / 2.0) / 100000.0
-"""
-_N_rows_shell = max(1, Turns_per_Tube * N_p_val)
-if Re_shell < SHELL_RE_TRANSITION:
-    _Eu_per_row = 10.0 / max(Re_shell, 1.0)**0.5
-else:
-    _Eu_per_row = 1.0 / max(Re_shell, 1.0)**0.2
 dp_shell_bar = (_Eu_per_row * _N_rows_shell * st.session_state['s_rho'] * v_shell**2 / 2.0) / 100000.0
 
 # =========================================================
@@ -656,12 +625,9 @@ for t_Dc in np.arange(st.session_state['d_o'] * 10.0, OPT_DC_MAX_MM, OPT_DC_STEP
     t_ho = t_shell_res['h_o']
     
     t_cr = d_i / t_Dc if t_Dc > 0 else 0
-    t_tube_res = calc_tube_side(
-        Re, Pr, t_cr, d_i_m, st.session_state['t_k'], v_tube,
-        st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i,
-        fluid_model=tube_flow_model
-    )
-    t_hi = t_tube_res['h_i']
+    t_Nu = (NU_LAMINAR_CONST if Re < RE_CRIT_BASE * (1.0 + RE_CRIT_CURVATURE_COEFF * np.sqrt(max(0, t_cr))) 
+            else NU_TURBULENT_COEFF * (max(Re, 1.0) ** NU_TURBULENT_RE_EXP) * (Pr ** NU_TURBULENT_PR_EXP))
+    t_hi = ((t_Nu * (1.0 + CURVATURE_NU_FACTOR * t_cr)) * st.session_state['t_k']) / max(d_i_m, EPSILON)
     
     t_u_res = calc_overall_U(t_hi, t_ho, st.session_state['R_fi'], st.session_state['R_fo'], R_wall, st.session_state['d_o'], d_i)
     t_U = t_u_res['U']
@@ -1560,16 +1526,8 @@ if not lmtd_error and d_i > 0:
         # Tube side
         _sv_m_per_tube = (m_t / 3600.0) / max(1, _sv_Np)
         _sv_v_tube = _sv_m_per_tube / (st.session_state['t_rho'] * A_c)
-        if tube_flow_model == "newtonian":
-            _sv_Re = (st.session_state['t_rho'] * _sv_v_tube * d_i_m) / max(EPSILON, t_mu_pa)
-        else:
-            _sv_term1 = st.session_state['t_rho'] * (_sv_v_tube ** (2.0 - n_val)) * ((max(EPSILON, d_i) / 1000.0) ** n_val)
-            _sv_Re = safe_div(_sv_term1, term2) if term2 > 0 else 0.0
-        _sv_tube = calc_tube_side(
-            _sv_Re, Pr, _sv_cr, d_i_m, st.session_state['t_k'], _sv_v_tube,
-            st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i,
-            fluid_model=tube_flow_model
-        )
+        _sv_Re = (st.session_state['t_rho'] * _sv_v_tube * d_i_m) / max(EPSILON, t_mu_pa) if "Liquid" in st.session_state['fluid_type'] else Re
+        _sv_tube = calc_tube_side(_sv_Re, Pr, _sv_cr, d_i_m, st.session_state['t_k'], _sv_v_tube, st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i)
         
         # Shell side
         _sv_LpT = np.sqrt((np.pi * _sv_Dc_m)**2 + _sv_Lead_m**2) if _sv_Dc_m > 0 else 1.0
@@ -1591,11 +1549,7 @@ if not lmtd_error and d_i > 0:
         _sv_LpTube = _sv_TL / _sv_Np
         _sv_Turns = _sv_LpTube / _sv_LpT
         
-        _sv_tube_dp = calc_tube_side(
-            _sv_Re, Pr, _sv_cr, d_i_m, st.session_state['t_k'], _sv_v_tube,
-            st.session_state['t_rho'], _sv_LpTube, st.session_state['d_o'], d_i,
-            fluid_model=tube_flow_model
-        )
+        _sv_tube_dp = calc_tube_side(_sv_Re, Pr, _sv_cr, d_i_m, st.session_state['t_k'], _sv_v_tube, st.session_state['t_rho'], _sv_LpTube, st.session_state['d_o'], d_i)
         sens_dpT.append(_sv_tube_dp['dp_bar'])
         
         _sv_L_shell = _sv_Turns * _sv_Lead_m
