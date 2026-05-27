@@ -3,7 +3,15 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
-import datetime
+
+from calculator import (
+    INIT_STATE,
+    apply_loaded_data,
+    calculate_design,
+    find_optimal_geometry,
+    format_datasheet_markdown,
+    format_html_report,
+)
 
 st.set_page_config(page_title="Helical Tube Heat Exchanger Designer", layout="wide")
 st.title("플랜트 공정 설계: Helical Tube Heat Exchanger 최적화")
@@ -161,33 +169,354 @@ def calc_overall_U(h_i, h_o, R_fi, R_fo, R_wall, d_o, d_i):
     }
 
 
+
+# =========================================================
+# [Drawing] 횡단면도 / 종단면도 생성 함수
+# =========================================================
+def create_cross_section_fig(shell_od, D_s, D_mandrel, D_c, d_o, d_i, N_p_val, shell_thick, t_thick):
+    fig_cs = go.Figure()
+    _th = np.linspace(0, 2*np.pi, 200)
+    _r_sod = shell_od / 2.0
+    _r_sid = D_s / 2.0
+    _r_man = D_mandrel / 2.0
+    _r_cl = D_c / 2.0
+    _r_to = d_o / 2.0
+    _r_ti = d_i / 2.0
+    inner_clearance_rad = ((D_c - d_o) - D_mandrel) / 2.0
+    outer_clearance_rad = (D_s - (D_c + d_o)) / 2.0
+
+    # Shell wall ring (OD→ID)
+    fig_cs.add_trace(go.Scatter(
+        x=np.concatenate([_r_sod*np.cos(_th), _r_sid*np.cos(_th[::-1])]).tolist(),
+        y=np.concatenate([_r_sod*np.sin(_th), _r_sid*np.sin(_th[::-1])]).tolist(),
+        fill='toself', fillcolor='rgba(120,144,156,0.3)', mode='lines',
+        line=dict(color='#455A64', width=2),
+        name=f'Shell Wall (t={shell_thick:.0f}mm)'))
+
+    # Mandrel (solid)
+    fig_cs.add_trace(go.Scatter(
+        x=(_r_man*np.cos(_th)).tolist(), y=(_r_man*np.sin(_th)).tolist(),
+        fill='toself', fillcolor='rgba(117,117,117,0.3)', mode='lines',
+        line=dict(color='#616161', width=2),
+        name=f'Mandrel Ø{D_mandrel:.1f}'))
+
+    # Coil CL (D_c)
+    fig_cs.add_trace(go.Scatter(
+        x=(_r_cl*np.cos(_th)).tolist(), y=(_r_cl*np.sin(_th)).tolist(),
+        mode='lines', line=dict(color='#E91E63', width=1.5, dash='dashdot'),
+        name=f'Coil CL (D_c={D_c:.1f})'))
+
+    # Tube cross-sections
+    _tt = np.linspace(0, 2*np.pi, 80)
+    _t_lc = ['#1565C0','#E65100','#2E7D32','#C62828','#6A1B9A','#4E342E','#00838F','#AD1457']
+    _t_fc = ['rgba(21,101,192,0.3)','rgba(230,81,0,0.3)','rgba(46,125,50,0.3)','rgba(198,40,40,0.3)',
+             'rgba(106,27,154,0.3)','rgba(78,52,46,0.3)','rgba(0,131,143,0.3)','rgba(173,20,87,0.3)']
+    for _i in range(N_p_val):
+        _a = _i * (2*np.pi / N_p_val)
+        _cx = _r_cl * np.cos(_a)
+        _cy = _r_cl * np.sin(_a)
+        _ci = _i % len(_t_lc)
+        if _r_ti > 0:
+            fig_cs.add_trace(go.Scatter(
+                x=np.concatenate([_cx+_r_to*np.cos(_tt), _cx+_r_ti*np.cos(_tt[::-1])]).tolist(),
+                y=np.concatenate([_cy+_r_to*np.sin(_tt), _cy+_r_ti*np.sin(_tt[::-1])]).tolist(),
+                fill='toself', fillcolor=_t_fc[_ci], mode='lines',
+                line=dict(color=_t_lc[_ci], width=1.5), name=f'Tube #{_i+1}'))
+            fig_cs.add_trace(go.Scatter(
+                x=(_cx+_r_ti*np.cos(_tt)).tolist(), y=(_cy+_r_ti*np.sin(_tt)).tolist(),
+                fill='toself', fillcolor='rgba(240,248,255,0.8)', mode='lines',
+                line=dict(color=_t_lc[_ci], width=0.8, dash='dot'), showlegend=False))
+
+    # Dimension annotations
+    _shapes_cs = []
+    _annots_cs = []
+
+    # Inner Clearance (45° direction)
+    _ie = _r_cl - _r_to
+    if inner_clearance_rad > 2:
+        _ad = np.pi / 4
+        _shapes_cs.append(dict(type='line', x0=_r_man*np.cos(_ad), y0=_r_man*np.sin(_ad),
+            x1=_ie*np.cos(_ad), y1=_ie*np.sin(_ad), line=dict(color='#D32F2F', width=1.5, dash='dot')))
+        _annots_cs.append(dict(x=(_r_man+_ie)/2*np.cos(_ad), y=(_r_man+_ie)/2*np.sin(_ad),
+            text=f'<b>Inner Clr.={inner_clearance_rad:.1f}</b>', showarrow=False,
+            font=dict(size=10, color='#D32F2F'), bgcolor='rgba(255,255,255,0.9)', yshift=12))
+
+    # Outer Clearance (45° direction)
+    _oe = _r_cl + _r_to
+    if outer_clearance_rad > 2:
+        _ad = np.pi / 4
+        _shapes_cs.append(dict(type='line', x0=_oe*np.cos(_ad), y0=_oe*np.sin(_ad),
+            x1=_r_sid*np.cos(_ad), y1=_r_sid*np.sin(_ad), line=dict(color='#1565C0', width=1.5, dash='dot')))
+        _annots_cs.append(dict(x=(_oe+_r_sid)/2*np.cos(_ad), y=(_oe+_r_sid)/2*np.sin(_ad),
+            text=f'<b>Outer Clr.={outer_clearance_rad:.1f}</b>', showarrow=False,
+            font=dict(size=10, color='#1565C0'), bgcolor='rgba(255,255,255,0.9)', yshift=12))
+
+    # Shell ID dimension (top)
+    _dy = _r_sod + 20
+    _shapes_cs.extend([
+        dict(type='line', x0=-_r_sid, y0=_dy, x1=_r_sid, y1=_dy, line=dict(color='#333', width=1)),
+        dict(type='line', x0=-_r_sid, y0=_r_sid+5, x1=-_r_sid, y1=_dy+10, line=dict(color='#333', width=0.5)),
+        dict(type='line', x0=_r_sid, y0=_r_sid+5, x1=_r_sid, y1=_dy+10, line=dict(color='#333', width=0.5))])
+    _annots_cs.append(dict(x=0, y=_dy, text=f'<b>Shell ID = {D_s:.1f} mm</b>',
+        showarrow=False, font=dict(size=11, color='#333'), bgcolor='rgba(255,255,255,0.9)', yshift=14))
+
+    # Mandrel OD dimension (bottom)
+    _dy2 = -(_r_sod + 20)
+    _shapes_cs.extend([
+        dict(type='line', x0=-_r_man, y0=_dy2, x1=_r_man, y1=_dy2, line=dict(color='#616161', width=1)),
+        dict(type='line', x0=-_r_man, y0=-_r_man-5, x1=-_r_man, y1=_dy2-10, line=dict(color='#616161', width=0.5)),
+        dict(type='line', x0=_r_man, y0=-_r_man-5, x1=_r_man, y1=_dy2-10, line=dict(color='#616161', width=0.5))])
+    _annots_cs.append(dict(x=0, y=_dy2, text=f'Mandrel OD = {D_mandrel:.1f} mm',
+        showarrow=False, font=dict(size=10, color='#616161'), bgcolor='rgba(255,255,255,0.9)', yshift=-14))
+
+    # D_c dimension (left)
+    _dx = -(_r_sod + 20)
+    _shapes_cs.extend([
+        dict(type='line', x0=_dx, y0=-_r_cl, x1=_dx, y1=_r_cl, line=dict(color='#E91E63', width=1)),
+        dict(type='line', x0=-_r_cl-5, y0=-_r_cl, x1=_dx-10, y1=-_r_cl, line=dict(color='#E91E63', width=0.5)),
+        dict(type='line', x0=-_r_cl-5, y0=_r_cl, x1=_dx-10, y1=_r_cl, line=dict(color='#E91E63', width=0.5))])
+    _annots_cs.append(dict(x=_dx, y=0, text=f'D_c={D_c:.1f}',
+        showarrow=False, font=dict(size=10, color='#E91E63'), bgcolor='rgba(255,255,255,0.9)',
+        xshift=-5, textangle=-90))
+
+    # Tube callout
+    if N_p_val > 0:
+        _annots_cs.append(dict(x=_r_cl+_r_to+5, y=_r_to+15,
+            text=f'OD={d_o:.1f}<br>ID={d_i:.1f}<br>t={t_thick:.2f}',
+            showarrow=True, arrowhead=2, arrowcolor='#1565C0', ax=50, ay=-30,
+            font=dict(size=9, color='#1565C0'), bgcolor='rgba(255,255,255,0.9)'))
+
+    fig_cs.update_layout(
+        xaxis=dict(scaleanchor='y', scaleratio=1, showgrid=False, zeroline=False, title='mm'),
+        yaxis=dict(showgrid=False, zeroline=False, title='mm'),
+        height=650, margin=dict(l=60, r=40, t=30, b=40),
+        plot_bgcolor='white', shapes=_shapes_cs, annotations=_annots_cs,
+        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99, bgcolor='rgba(255,255,255,0.9)'))
+    return fig_cs
+
+
+def create_longitudinal_fig(D_s, D_mandrel, D_c, d_o, N_p_val, shell_thick, pitch_mm, Shell_TT_Length_mm, L_shell_mm, Turns_per_Tube):
+    fig_ls = go.Figure()
+    _Ds = D_s
+    _Dm = D_mandrel
+    _Dc = D_c
+    _do2 = d_o
+    _pmm = pitch_mm
+    _lmm = _pmm * N_p_val
+    _st2 = shell_thick
+    _hd = _Ds / 4.0
+
+    _y_bot = 0.0
+    _y_top = Shell_TT_Length_mm
+    _coil_y0 = _hd
+    _coil_y1 = _coil_y0 + L_shell_mm
+
+    # Left Wall
+    fig_ls.add_trace(go.Scatter(
+        x=[-_Ds/2-_st2, -_Ds/2, -_Ds/2, -_Ds/2-_st2, -_Ds/2-_st2],
+        y=[_y_bot, _y_bot, _y_top, _y_top, _y_bot],
+        fill='toself', fillcolor='rgba(120,144,156,0.35)', mode='lines',
+        line=dict(color='#455A64', width=2), name=f'Shell Wall (t={_st2:.0f}mm)'))
+    # Right Wall
+    fig_ls.add_trace(go.Scatter(
+        x=[_Ds/2, _Ds/2+_st2, _Ds/2+_st2, _Ds/2, _Ds/2],
+        y=[_y_bot, _y_bot, _y_top, _y_top, _y_bot],
+        fill='toself', fillcolor='rgba(120,144,156,0.35)', mode='lines',
+        line=dict(color='#455A64', width=2), showlegend=False))
+
+    # Dish Heads
+    _thh = np.linspace(0, np.pi, 100)
+    fig_ls.add_trace(go.Scatter(
+        x=(_Ds/2*np.cos(_thh)).tolist(), y=(_y_bot - _hd*np.sin(_thh)).tolist(),
+        mode='lines', line=dict(color='#455A64', width=2.5), name='Dish Head (2:1 Ellip.)'))
+    fig_ls.add_trace(go.Scatter(
+        x=(_Ds/2*np.cos(_thh)).tolist(), y=(_y_top + _hd*np.sin(_thh)).tolist(),
+        mode='lines', line=dict(color='#455A64', width=2.5), showlegend=False))
+
+    # Mandrel
+    fig_ls.add_trace(go.Scatter(
+        x=[-_Dm/2, _Dm/2, _Dm/2, -_Dm/2, -_Dm/2],
+        y=[_coil_y0, _coil_y0, _coil_y1, _coil_y1, _coil_y0],
+        fill='toself', fillcolor='rgba(158,158,158,0.20)', mode='lines',
+        line=dict(color='#9E9E9E', width=1.5, dash='dot'), name=f'Mandrel Ø{_Dm:.0f}'))
+
+    # Hatch lines
+    _hatch_step = max(30, _Dm / 5)
+    _hatch_x, _hatch_y = [], []
+    for _hy in np.arange(_coil_y0, _coil_y1, _hatch_step):
+        _hatch_x.extend([-_Dm/2, _Dm/2, None])
+        _hatch_y.extend([_hy, _hy + _hatch_step * 0.5, None])
+    fig_ls.add_trace(go.Scatter(
+        x=_hatch_x, y=_hatch_y, mode='lines',
+        line=dict(color='rgba(158,158,158,0.15)', width=0.5), showlegend=False, hoverinfo='skip'))
+
+    # Tube sections
+    _tr2 = _do2 / 2.0
+    _max_vis = 50
+    _ls_lc = ['#1565C0','#E65100','#2E7D32','#C62828','#6A1B9A','#4E342E','#00838F','#AD1457']
+    _ls_fc = ['rgba(21,101,192,0.40)','rgba(230,81,0,0.40)','rgba(46,125,50,0.40)','rgba(198,40,40,0.40)',
+              'rgba(106,27,154,0.40)','rgba(78,52,46,0.40)','rgba(0,131,143,0.40)','rgba(173,20,87,0.40)']
+    _trunc = False
+    _tube_shapes = []
+
+    for _ti in range(N_p_val):
+        _ci2 = _ti % len(_ls_lc)
+        _z_off = _ti * _pmm
+        _cr_count = 0
+        _cl_count = 0
+        for _k in range(int(np.ceil(Turns_per_Tube)) + 1):
+            _rz = _z_off + _k * _lmm
+            if 0 <= _rz <= L_shell_mm and _cr_count < _max_vis:
+                _tube_shapes.append(dict(
+                    type='circle', x0=_Dc/2 - _tr2, x1=_Dc/2 + _tr2,
+                    y0=_coil_y0 + _rz - _tr2, y1=_coil_y0 + _rz + _tr2,
+                    fillcolor=_ls_fc[_ci2], line=dict(color=_ls_lc[_ci2], width=1.5)))
+                _cr_count += 1
+            elif _rz <= L_shell_mm:
+                _trunc = True
+
+            _lz = _z_off + _lmm / 2.0 + _k * _lmm
+            if 0 <= _lz <= L_shell_mm and _cl_count < _max_vis:
+                _tube_shapes.append(dict(
+                    type='circle', x0=-_Dc/2 - _tr2, x1=-_Dc/2 + _tr2,
+                    y0=_coil_y0 + _lz - _tr2, y1=_coil_y0 + _lz + _tr2,
+                    fillcolor=_ls_fc[_ci2], line=dict(color=_ls_lc[_ci2], width=1.5)))
+                _cl_count += 1
+            elif _lz <= L_shell_mm:
+                _trunc = True
+
+    for _ti in range(N_p_val):
+        _ci2 = _ti % len(_ls_lc)
+        fig_ls.add_trace(go.Scatter(
+            x=[None], y=[None], mode='markers',
+            marker=dict(size=10, color=_ls_fc[_ci2], line=dict(color=_ls_lc[_ci2], width=2)),
+            name=f'Tube #{_ti+1}'))
+
+    # Nozzles
+    _noz_len = max(_do2 * 3.0, 60)
+    _noz_w = max(_do2 * 1.0, 20)
+    _sin_y = _coil_y0 + _pmm / 2
+    fig_ls.add_trace(go.Scatter(
+        x=[_Ds/2+_st2, _Ds/2+_st2+_noz_len, _Ds/2+_st2+_noz_len, _Ds/2+_st2],
+        y=[_sin_y-_noz_w/2, _sin_y-_noz_w/2, _sin_y+_noz_w/2, _sin_y+_noz_w/2],
+        fill='toself', fillcolor='rgba(33,150,243,0.25)', mode='lines',
+        line=dict(color='#1976D2', width=2), name='Shell Nozzle'))
+
+    _sout_y = _coil_y1 - _pmm / 2
+    fig_ls.add_trace(go.Scatter(
+        x=[-_Ds/2-_st2, -_Ds/2-_st2-_noz_len, -_Ds/2-_st2-_noz_len, -_Ds/2-_st2],
+        y=[_sout_y-_noz_w/2, _sout_y-_noz_w/2, _sout_y+_noz_w/2, _sout_y+_noz_w/2],
+        fill='toself', fillcolor='rgba(33,150,243,0.25)', mode='lines',
+        line=dict(color='#1976D2', width=2), showlegend=False))
+
+    fig_ls.add_trace(go.Scatter(
+        x=[-_noz_w/2, _noz_w/2, _noz_w/2, -_noz_w/2, -_noz_w/2],
+        y=[_y_top+_hd*0.3, _y_top+_hd*0.3, _y_top+_hd*0.3+_noz_len, _y_top+_hd*0.3+_noz_len, _y_top+_hd*0.3],
+        fill='toself', fillcolor='rgba(229,57,53,0.25)', mode='lines',
+        line=dict(color='#D32F2F', width=2), name='Tube Nozzle'))
+
+    fig_ls.add_trace(go.Scatter(
+        x=[-_noz_w/2, _noz_w/2, _noz_w/2, -_noz_w/2, -_noz_w/2],
+        y=[_y_bot-_hd*0.3, _y_bot-_hd*0.3, _y_bot-_hd*0.3-_noz_len, _y_bot-_hd*0.3-_noz_len, _y_bot-_hd*0.3],
+        fill='toself', fillcolor='rgba(229,57,53,0.25)', mode='lines',
+        line=dict(color='#D32F2F', width=2), showlegend=False))
+
+    # Dimension lines
+    _sh_ls = list(_tube_shapes)
+    _an_ls = []
+    _dim_gap = max(_noz_len + 30, 80)
+
+    _dx_r = _Ds/2 + _st2 + _dim_gap
+    _sh_ls.extend([
+        dict(type='line', x0=_dx_r, y0=_y_bot, x1=_dx_r, y1=_y_top, line=dict(color='#333', width=1.5)),
+        dict(type='line', x0=_Ds/2+_st2+10, y0=_y_bot, x1=_dx_r+15, y1=_y_bot, line=dict(color='#333', width=0.5)),
+        dict(type='line', x0=_Ds/2+_st2+10, y0=_y_top, x1=_dx_r+15, y1=_y_top, line=dict(color='#333', width=0.5))])
+    _an_ls.append(dict(x=_dx_r+5, y=_y_top/2, text=f'<b>T/T = {Shell_TT_Length_mm:,.0f} mm</b>',
+        showarrow=False, font=dict(size=11, color='#333'), bgcolor='rgba(255,255,255,0.95)', xshift=5, textangle=-90))
+
+    _dx_l = -(_Ds/2 + _st2 + _dim_gap)
+    _sh_ls.extend([
+        dict(type='line', x0=_dx_l, y0=_coil_y0, x1=_dx_l, y1=_coil_y1, line=dict(color='#E91E63', width=1.5)),
+        dict(type='line', x0=-(_Ds/2+_st2+10), y0=_coil_y0, x1=_dx_l-15, y1=_coil_y0, line=dict(color='#E91E63', width=0.5)),
+        dict(type='line', x0=-(_Ds/2+_st2+10), y0=_coil_y1, x1=_dx_l-15, y1=_coil_y1, line=dict(color='#E91E63', width=0.5))])
+    _an_ls.append(dict(x=_dx_l-5, y=(_coil_y0+_coil_y1)/2, text=f'<b>Coil H = {L_shell_mm:,.0f} mm</b>',
+        showarrow=False, font=dict(size=10, color='#E91E63'), bgcolor='rgba(255,255,255,0.95)', xshift=-5, textangle=-90))
+
+    _dim_y_top = _y_top + _hd + _noz_len + 30
+    _sh_ls.extend([
+        dict(type='line', x0=-_Ds/2, y0=_dim_y_top, x1=_Ds/2, y1=_dim_y_top, line=dict(color='#455A64', width=1)),
+        dict(type='line', x0=-_Ds/2, y0=_y_top+5, x1=-_Ds/2, y1=_dim_y_top+10, line=dict(color='#455A64', width=0.5)),
+        dict(type='line', x0=_Ds/2, y0=_y_top+5, x1=_Ds/2, y1=_dim_y_top+10, line=dict(color='#455A64', width=0.5))])
+    _an_ls.append(dict(x=0, y=_dim_y_top+5, text=f'<b>Shell ID = {D_s:.0f} mm</b>',
+        showarrow=False, font=dict(size=10, color='#455A64'), bgcolor='rgba(255,255,255,0.95)'))
+
+    _right_positions = []
+    for _ti in range(N_p_val):
+        _z_off = _ti * _pmm
+        for _k in range(int(np.ceil(Turns_per_Tube)) + 1):
+            _rz = _z_off + _k * _lmm
+            if 0 <= _rz <= L_shell_mm:
+                _right_positions.append(_coil_y0 + _rz)
+                break
+    _right_positions.sort()
+    if len(_right_positions) >= 2:
+        _pz0 = _right_positions[0]
+        _pz1 = _right_positions[1]
+        _px = _Dc/2 + _tr2 + 20
+        _sh_ls.extend([
+            dict(type='line', x0=_px, y0=_pz0, x1=_px, y1=_pz1, line=dict(color='#FF6F00', width=1.5)),
+            dict(type='line', x0=_px-8, y0=_pz0, x1=_px+8, y1=_pz0, line=dict(color='#FF6F00', width=0.8)),
+            dict(type='line', x0=_px-8, y0=_pz1, x1=_px+8, y1=_pz1, line=dict(color='#FF6F00', width=0.8))])
+        _an_ls.append(dict(x=_px+5, y=(_pz0+_pz1)/2, text=f'<b>p={_pmm:.1f}</b>',
+            showarrow=False, font=dict(size=10, color='#FF6F00'), bgcolor='rgba(255,255,255,0.95)', xshift=5))
+
+    _an_ls.extend([
+        dict(x=_Ds/2+_st2+_noz_len/2, y=_sin_y, text='<b>Shell In →</b>', 
+             showarrow=False, font=dict(size=10, color='#1976D2'), bgcolor='rgba(255,255,255,0.9)', yshift=_noz_w/2+12),
+        dict(x=-(_Ds/2+_st2+_noz_len/2), y=_sout_y, text='<b>← Shell Out</b>',
+             showarrow=False, font=dict(size=10, color='#1976D2'), bgcolor='rgba(255,255,255,0.9)', yshift=_noz_w/2+12),
+        dict(x=0, y=_y_top+_hd*0.3+_noz_len+8, text='<b>Tube In ↓</b>', 
+             showarrow=False, font=dict(size=10, color='#D32F2F'), bgcolor='rgba(255,255,255,0.9)'),
+        dict(x=0, y=_y_bot-_hd*0.3-_noz_len-8, text='<b>↑ Tube Out</b>', 
+             showarrow=False, font=dict(size=10, color='#D32F2F'), bgcolor='rgba(255,255,255,0.9)'),
+        dict(x=0, y=(_coil_y0+_coil_y1)/2, text='<b>CL</b>', showarrow=False, 
+             font=dict(size=11, color='rgba(0,0,0,0.15)'), opacity=0.5),
+        dict(x=0, y=_coil_y0 + 15, text=f'Mandrel Ø{_Dm:.0f}', showarrow=False,
+             font=dict(size=9, color='#9E9E9E'), bgcolor='rgba(255,255,255,0.8)'),
+    ])
+
+    _sh_ls.append(dict(type='line', x0=0, y0=_y_bot-_hd-_noz_len-20, x1=0, y1=_y_top+_hd+_noz_len+40,
+                      line=dict(color='rgba(0,0,0,0.08)', width=1, dash='dashdot')))
+
+    _margin_x = max(_noz_len + 50, _dim_gap + 30)
+    _x_min = -(_Ds/2 + _st2 + _margin_x)
+    _x_max = _Ds/2 + _st2 + _margin_x
+    _margin_y_bot = _hd + _noz_len + 30
+    _margin_y_top = _hd + _noz_len + 50
+    _y_min = _y_bot - _margin_y_bot
+    _y_max = _y_top + _margin_y_top
+
+    _data_width = _x_max - _x_min
+    _data_height = _y_max - _y_min
+    _aspect_ratio = _data_height / max(_data_width, 1.0)
+    _chart_usable_width_px = 700
+    _chart_h = int(max(500, min(1600, _chart_usable_width_px * _aspect_ratio)))
+
+    fig_ls.update_layout(
+        xaxis=dict(scaleanchor='y', scaleratio=1, showgrid=False, zeroline=False, title='Width (mm)',
+                   range=[_x_min, _x_max]),
+        yaxis=dict(showgrid=False, zeroline=False, title='Height (mm)',
+                   range=[_y_min, _y_max]),
+        height=_chart_h, margin=dict(l=80, r=80, t=30, b=40),
+        plot_bgcolor='white', shapes=_sh_ls, annotations=_an_ls,
+        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99, bgcolor='rgba(255,255,255,0.9)'))
+    return fig_ls, _trunc
+
+
 # =========================================================
 # [A] 글로벌 상태(Session State) 초기화 (이전 코드 유지)
 # =========================================================
-init_state = {
-    'tag_no': 'HE-101', 
-    'tube_fluid_name': 'Process Slurry',
-    'shell_fluid_name': 'Hot Water / Steam',
-    'fluid_type': "Liquid (뉴턴 유체 - 물, 오일 등)",
-    't_rho': 998.0, 't_cp': 4180.0, 't_k': 0.6, 't_mu': 1.0, 
-    's_rho': 998.0, 's_mu': 1.0, 's_cp': 4180.0, 's_k': 0.6,
-    'rheology_model': "Power-law (멱법칙)",
-    'tau_y': 5.0, 'plastic_visc': 0.05,
-    'consistency_k': 0.1, 'flow_index_n': 0.8,
-    'm_hot': 5000.0, 'm_cold': 8000.0,
-    'T_hot_in': 30.0, 'T_hot_out': 80.0,
-    'T_cold_in': 120.0, 'T_cold_out': 90.0,
-    'allowable_dp_tube': 1.5, 'allowable_dp_shell': 0.5,
-    'N_p': 3, 
-    'd_o': 25.4, 't_thick': 2.11, 'D_c': 400.0, 'pitch': 50.0, 'D_s': 500.0,
-    'shell_thick': 10.0,
-    'D_mandrel': 350.0, 
-    'tube_material': 'Stainless Steel 316 (k=16)', 'tube_k_wall': 16.0,
-    'R_fi': 0.000176, 'R_fo': 0.000176,
-    'overdesign_pct': 10.0,
-    'design_p_shell': 10.0, 'allow_s_shell': 137.9, 'joint_e': 0.85, 'ca_shell': 3.0,
-    'orientation': 'Vertical (수직형)'
-}
+init_state = INIT_STATE.copy()
 
 for k, v in init_state.items():
     if k not in st.session_state:
@@ -199,10 +528,9 @@ def apply_json():
         st.warning("JSON 데이터를 입력하십시오.")
         return
     try:
-        parsed_data = json.loads(json_str)
-        for k in init_state.keys():
-            if k in parsed_data:
-                st.session_state[k] = parsed_data[k]
+        parsed_data = apply_loaded_data(json_str)
+        for k, v in parsed_data.items():
+            st.session_state[k] = v
         st.success(f"✅ 설계 데이터(Tag: {st.session_state.get('tag_no')}) 로드 완료.")
     except Exception as e:
         st.error(f"🚨 데이터 로드 실패: {e}")
@@ -392,8 +720,9 @@ with col_g2:
     except ValueError: mat_idx = len(mat_keys) - 1
 
     selected_mat = st.selectbox("Tube Material", mat_keys, index=mat_idx)
+    st.session_state['tube_material'] = selected_mat
     if "Custom" in selected_mat:
-        st.session_state['tube_k_wall'] = st.number_input("열전도도 입력", value=float(curr_k))
+        st.session_state['tube_k_wall'] = st.number_input("열전도도 입력", value=float(curr_k), min_value=0.01)
     else:
         st.session_state['tube_k_wall'] = mat_dict[selected_mat]
 
@@ -494,168 +823,121 @@ with cc3:
 with cc4:
     st.number_input("부식 여유 (C.A., mm)", step=0.5, key='ca_shell', help="탄소강 기본 3.0mm")
 
+current_inputs = {k: st.session_state[k] for k in init_state.keys()}
+calc_result = calculate_design(current_inputs)
+calc = calc_result.values
+for error in calc_result.errors:
+    st.error(f"🚨 {error}")
+for warning in calc_result.warnings:
+    st.warning(f"⚠️ {warning}")
+
 P_mpa = st.session_state['design_p_shell'] / 10.0
 R_mm = st.session_state['D_s'] / 2.0
 S_mpa = st.session_state['allow_s_shell']
 E_eff = st.session_state['joint_e']
 C_A = st.session_state['ca_shell']
 
-t_req = (P_mpa * R_mm) / (S_mpa * E_eff - 0.6 * P_mpa) + C_A
-t_final = max(MIN_SHELL_THICKNESS_MM, np.ceil(t_req))
+d_i = calc.get('d_i', st.session_state['d_o'] - 2 * st.session_state['t_thick'])
+t_req = calc.get('t_req', 0.0)
+t_final = calc.get('t_final', st.session_state['shell_thick'])
 st.session_state['shell_thick'] = t_final
-shell_od = st.session_state['D_s'] + 2.0 * t_final
+shell_od = calc.get('shell_od', st.session_state['D_s'] + 2.0 * t_final)
 
-st.info(f"✓ 상업용 Shell Thickness: **{t_final:.0f} mm** 확정 (ASME 이론 두께: {t_req:.2f} mm)")
+if calc_result.is_valid:
+    st.info(f"✓ 상업용 Shell Thickness: **{t_final:.0f} mm** 확정 (ASME 이론 두께: {t_req:.2f} mm)")
+else:
+    st.info("입력 검증 오류가 해소되면 두께/수력학 계산이 자동으로 갱신됩니다.")
 
 # =========================================================
-# [G] 백그라운드 수력학/열역학 코어 연산 — 리팩토링된 함수 호출
+# [G] 백그라운드 수력학/열역학 코어 연산 (검증/순수 함수 기반)
 # =========================================================
 t_mu_pa = st.session_state.get('t_mu', 1.0) / 1000.0
 s_mu_pa = st.session_state.get('s_mu', 1.0) / 1000.0
-curvature_ratio = d_i / st.session_state['D_c'] if st.session_state['D_c'] > 0 else 0
-
-m_hot_per_tube = (m_t / 3600.0) / max(1, st.session_state['N_p'])
-A_c = np.pi * ((d_i / 1000.0) ** 2) / 4.0 if d_i > 0 else EPSILON
-v_tube = m_hot_per_tube / (st.session_state['t_rho'] * A_c)
-
-if "Liquid" in st.session_state['fluid_type']:
-    Re = (st.session_state['t_rho'] * v_tube * (max(EPSILON, d_i) / 1000.0)) / max(EPSILON, t_mu_pa)
-    Pr = (st.session_state['t_cp'] * t_mu_pa) / max(EPSILON, st.session_state['t_k'])
-else:
-    n_val = st.session_state['flow_index_n'] if "Power" in st.session_state['rheology_model'] else 1.0
-    K_val = st.session_state['consistency_k'] if "Power" in st.session_state['rheology_model'] else st.session_state['plastic_visc']
-    D_m_tube = max(EPSILON, d_i) / 1000.0
-    term1 = st.session_state['t_rho'] * (v_tube ** (2.0 - n_val)) * (D_m_tube ** n_val)
-    term2 = (8.0 ** (n_val - 1.0)) * max(K_val, 0.0001) * (((3.0 * n_val + 1.0) / (4.0 * n_val)) ** n_val)
-    Re = safe_div(term1, term2) if term2 > 0 else 0.0
-    mu_app = safe_div(term1, Re * v_tube) if (Re * v_tube) > 0 else 0.001
-    Pr = (st.session_state['t_cp'] * mu_app) / max(EPSILON, st.session_state['t_k'])
-
-m_cold_kg_s = m_s / 3600.0
-D_s_m = st.session_state['D_s'] / 1000.0
-D_man_m = st.session_state['D_mandrel'] / 1000.0
-d_o_m = st.session_state['d_o'] / 1000.0
-
-N_p_val = max(1, st.session_state['N_p'])
-p_m = st.session_state['pitch'] / 1000.0
-D_c_m = st.session_state['D_c'] / 1000.0
-Lead_m = p_m * N_p_val
-Length_per_Turn = np.sqrt((np.pi * D_c_m)**2 + Lead_m**2) if D_c_m > 0 else 1.0
-
-A_annulus = (np.pi / 4.0) * (D_s_m**2 - D_man_m**2)
+curvature_ratio = calc.get('curvature_ratio', 0.0)
+m_hot_per_tube = calc.get('m_hot_per_tube', 0.0)
+A_c = calc.get('A_c', 1e-6)
+v_tube = calc.get('v_tube', 0.0)
+Re = calc.get('Re', 0.0)
+Pr = calc.get('Pr', 0.0)
+De = calc.get('De', 0.0)
+Re_crit = calc.get('Re_crit', 0.0)
+f_c = calc.get('f_c', 0.0)
+Nu_straight = calc.get('Nu_straight', 0.0)
+Nu_calc = calc.get('Nu_calc', 0.0)
+h_i = calc.get('h_i', 0.0)
+m_cold_kg_s = calc.get('m_cold_kg_s', m_s / 3600.0)
+D_s_m = calc.get('D_s_m', st.session_state['D_s'] / 1000.0)
+D_man_m = calc.get('D_man_m', st.session_state['D_mandrel'] / 1000.0)
+d_o_m = calc.get('d_o_m', st.session_state['d_o'] / 1000.0)
+N_p_val = calc.get('N_p_val', max(1, st.session_state['N_p']))
+p_m = calc.get('p_m', st.session_state['pitch'] / 1000.0)
+D_c_m = calc.get('D_c_m', st.session_state['D_c'] / 1000.0)
+Lead_m = calc.get('Lead_m', p_m * N_p_val)
+Length_per_Turn = calc.get('Length_per_Turn', 1.0)
+A_annulus = calc.get('A_annulus', 0.0)
 A_tube_cross = (np.pi / 4.0) * (d_o_m**2)
-A_blocked = N_p_val * A_tube_cross * safe_div(Length_per_Turn, Lead_m)
-A_free_flow = max(A_annulus * 0.1, A_annulus - A_blocked)
+A_blocked = calc.get('A_blocked', 0.0)
+A_free_flow = calc.get('A_free_flow', 0.0)
+v_shell = calc.get('v_shell', 0.0)
+D_e_shell = calc.get('D_e_shell', 0.0)
+Re_shell = calc.get('Re_shell', 0.0)
+Pr_shell = calc.get('Pr_shell', 0.0)
+Nu_shell = calc.get('Nu_shell', 0.0)
+h_o = calc.get('h_o', 0.0)
+pitch_ratio = calc.get('pitch_ratio', st.session_state['pitch'] / max(1e-6, st.session_state['d_o']))
+penalty_factor = calc.get('penalty_factor', 1.0)
+R_wall = calc.get('R_wall', 0.0)
+U_calc = calc.get('U_calc', 0.0)
+Area_req = calc.get('Area_req', 0.0)
+Area_design = calc.get('Area_design', 0.0)
+Total_Tube_Length = calc.get('Total_Tube_Length', 0.0)
+Length_per_Tube = calc.get('Length_per_Tube', 0.0)
+Turns_per_Tube = calc.get('Turns_per_Tube', 0.0)
+dp_tube_bar = calc.get('dp_tube_bar', 0.0)
+L_shell_m = calc.get('L_shell_m', 0.0)
+L_shell_mm = calc.get('L_shell_mm', 0.0)
+f_s = calc.get('f_s', 0.0)
+dp_shell_bar = calc.get('dp_shell_bar', 0.0)
+inner_clearance_rad = calc.get('inner_clearance_rad', ((st.session_state['D_c'] - st.session_state['d_o']) - st.session_state['D_mandrel']) / 2.0)
+outer_clearance_rad = calc.get('outer_clearance_rad', (st.session_state['D_s'] - (st.session_state['D_c'] + st.session_state['d_o'])) / 2.0)
 
-v_shell = safe_div(m_cold_kg_s, st.session_state['s_rho'] * A_free_flow) if A_free_flow > 0 else 0.0
+# UI 메트릭 연동을 위한 헬퍼 딕셔너리 생성
+_re_crit_val = calc.get('Re_crit', 2100.0)
+_re_val = calc.get('Re', 0.0)
+_f_c = calc.get('f_c', 0.0)
+_f_straight = (64.0 / max(_re_val, 1.0)) if _re_val < _re_crit_val else (0.184 / (max(_re_val, 1.0) ** 0.2))
+_dean_factor = _f_c / _f_straight if _f_straight > 0 else 1.0
 
-D_e_shell = D_s_m - D_man_m
-Re_shell = (st.session_state['s_rho'] * v_shell * D_e_shell) / max(EPSILON, s_mu_pa)
-Pr_shell = (st.session_state['s_cp'] * s_mu_pa) / max(EPSILON, st.session_state['s_k'])
-
-# --- 리팩토링된 Tube 측 계산 함수 호출 ---
-d_i_m = max(EPSILON, d_i) / 1000.0
-# 임시로 Area/Length 추정 (반복 계산 위해 L_tube 필요)
-# 먼저 shell 측을 구해서 U→Area→Length 유도
-pitch_ratio = st.session_state['pitch'] / max(EPSILON, st.session_state['d_o'])
-shell_result = calc_shell_side(Re_shell, Pr_shell, st.session_state['s_k'], d_o_m, pitch_ratio)
-h_o = shell_result['h_o']
-penalty_factor = shell_result['penalty_factor']
-
-R_wall = (d_o_m * np.log(st.session_state['d_o'] / max(EPSILON, d_i))) / (2.0 * max(EPSILON, st.session_state['tube_k_wall'])) if d_i > 0 else 0
-
-# Tube 측 h_i (Dean factor는 dp 전용이므로 우선 Nu 계산)
-tube_result_pre = calc_tube_side(Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube, st.session_state['t_rho'], 1.0, st.session_state['d_o'], d_i)
-h_i = tube_result_pre['h_i']
-
-# 총괄 U 계산
-u_result = calc_overall_U(h_i, h_o, st.session_state['R_fi'], st.session_state['R_fo'], R_wall, st.session_state['d_o'], d_i)
-U_calc = u_result['U']
-
-Area_req = (Q_kW * 1000.0) / (U_calc * LMTD) if not lmtd_error else 0.0
-Area_design = Area_req * (1.0 + st.session_state['overdesign_pct'] / 100.0)
-
-Total_Tube_Length = safe_div(Area_design, np.pi * d_o_m) if d_o_m > 0 else 0.0
-Length_per_Tube = Total_Tube_Length / N_p_val
-Turns_per_Tube = Length_per_Tube / Length_per_Turn
-
-# 정확한 L_tube로 Tube 측 dp 재계산
-tube_result = calc_tube_side(Re, Pr, curvature_ratio, d_i_m, st.session_state['t_k'], v_tube, st.session_state['t_rho'], Length_per_Tube, st.session_state['d_o'], d_i)
-dp_tube_bar = tube_result['dp_bar']
-
-L_shell_m = Turns_per_Tube * Lead_m
-L_shell_mm = L_shell_m * 1000.0
-# Shell ΔP: Zukauskas tube bank crossflow correlation
-# Eu (Euler number per row) ≈ C × Re^n, then ΔP = Eu × N_rows × ρv²/2
-_N_rows_shell = max(1, Turns_per_Tube * N_p_val)  # 유효 tube row 수
-if Re_shell < SHELL_RE_TRANSITION:
-    _Eu_per_row = 10.0 / max(Re_shell, 1.0)**0.5  # 층류: Eu ∝ Re^-0.5
-else:
-    _Eu_per_row = 1.0 / max(Re_shell, 1.0)**0.2   # 난류: Eu ∝ Re^-0.2
-dp_shell_bar = (_Eu_per_row * _N_rows_shell * st.session_state['s_rho'] * v_shell**2 / 2.0) / 100000.0
+tube_result = {
+    'flow_regime': '난류 (Turbulent)' if _re_val >= _re_crit_val else '층류 (Laminar)',
+    'dean_factor': _dean_factor,
+    'De': calc.get('De', 0.0),
+    'Re_crit': _re_crit_val
+}
+shell_result = {
+    'flow_regime': '난류 (Turbulent)' if calc.get('Re_shell', 0.0) >= 2100.0 else '층류 (Laminar)'
+}
 
 # =========================================================
 # [H] AI 최적화 제안 (Optimizer) — 리팩토링 (함수 재사용)
 # =========================================================
-opt_best_Dc = None
-opt_min_LTT = float('inf')
-opt_best_Dm = None
-opt_best_Ds = None
-opt_p_m = (st.session_state['d_o'] * PITCH_RATIO_REF) / 1000.0
-opt_Lead_m = opt_p_m * N_p_val
-
-for t_Dc in np.arange(st.session_state['d_o'] * 10.0, OPT_DC_MAX_MM, OPT_DC_STEP_MM):
-    t_Dc_m = t_Dc / 1000.0
-    t_Dm = max(10.0, t_Dc - st.session_state['d_o'] - MANDREL_ASSEMBLY_GAP_MM)
-    t_Dm_m = t_Dm / 1000.0
-    t_Ds = t_Dc + st.session_state['d_o'] + MIN_SHELL_RADIAL_GAP_MM
-    t_Ds_m = t_Ds / 1000.0
-
-    t_A_annulus = (np.pi / 4.0) * (t_Ds_m**2 - t_Dm_m**2)
-    t_Length_per_Turn = np.sqrt((np.pi * t_Dc_m)**2 + opt_Lead_m**2) if t_Dc_m > 0 else 1.0
-    t_A_blocked = N_p_val * ((np.pi / 4.0) * (d_o_m**2)) * safe_div(t_Length_per_Turn, opt_Lead_m)
-    t_A_free = max(t_A_annulus * 0.1, t_A_annulus - t_A_blocked)
-
-    t_v_shell = safe_div(m_cold_kg_s, st.session_state['s_rho'] * t_A_free) if t_A_free > 0 else 0.0
-    t_Re_shell = (st.session_state['s_rho'] * t_v_shell * (t_Ds_m - t_Dm_m)) / max(EPSILON, s_mu_pa)
-    
-    # 리팩토링된 함수 사용 (Optimizer는 pitch = OD × 1.25 고정이므로 pitch_ratio = 1.25)
-    t_shell_res = calc_shell_side(t_Re_shell, Pr_shell, st.session_state['s_k'], d_o_m, 
-                                  PITCH_RATIO_REF)
-    t_ho = t_shell_res['h_o']
-    
-    t_cr = d_i / t_Dc if t_Dc > 0 else 0
-    t_Nu = (NU_LAMINAR_CONST if Re < RE_CRIT_BASE * (1.0 + RE_CRIT_CURVATURE_COEFF * np.sqrt(max(0, t_cr))) 
-            else NU_TURBULENT_COEFF * (max(Re, 1.0) ** NU_TURBULENT_RE_EXP) * (Pr ** NU_TURBULENT_PR_EXP))
-    t_hi = ((t_Nu * (1.0 + CURVATURE_NU_FACTOR * t_cr)) * st.session_state['t_k']) / max(d_i_m, EPSILON)
-    
-    t_u_res = calc_overall_U(t_hi, t_ho, st.session_state['R_fi'], st.session_state['R_fo'], R_wall, st.session_state['d_o'], d_i)
-    t_U = t_u_res['U']
-    t_Area_req = (Q_kW * 1000.0) / (t_U * LMTD) if not lmtd_error else 0.0
-    t_Area_design = t_Area_req * (1.0 + st.session_state['overdesign_pct'] / 100.0)
-    
-    t_Turns = safe_div(t_Area_design, np.pi * d_o_m * N_p_val) / (np.sqrt((np.pi * t_Dc_m)**2 + opt_Lead_m**2) if t_Dc_m > 0 else 1.0)
-    t_L_shell_m = t_Turns * opt_Lead_m
-    t_L_TT = t_L_shell_m + (t_Ds_m / 2.0)
-    
-    if t_Dc_m < t_L_TT: 
-        if t_L_TT < opt_min_LTT:
-            opt_min_LTT = t_L_TT
-            opt_best_Dc = t_Dc
-            opt_best_Dm = t_Dm
-            opt_best_Ds = t_Ds
+opt_results = find_optimal_geometry(current_inputs, calc) if calc_result.is_valid else {"opt_best_Dc": None, "opt_min_LTT": None, "opt_best_Dm": None, "opt_best_Ds": None}
+opt_best_Dc = opt_results["opt_best_Dc"]
+opt_min_LTT = opt_results["opt_min_LTT"]
+opt_best_Dm = opt_results["opt_best_Dm"]
+opt_best_Ds = opt_results["opt_best_Ds"]
 
 # =========================================================
 # [I] 실시간 Bounding Box 렌더링 (이전 코드 유지)
 # =========================================================
-Shell_TT_Length_m = L_shell_m + (D_s_m / 2.0)  # 2:1 Ellip. Head depth = D_s/4 × 2
-Shell_TT_Length_mm = Shell_TT_Length_m * 1000.0
+Shell_TT_Length_m = calc.get('Shell_TT_Length_m', L_shell_m + (2.0 * D_s_m))
+Shell_TT_Length_mm = calc.get('Shell_TT_Length_mm', Shell_TT_Length_m * 1000.0)
 shell_od_m = shell_od / 1000.0
 
 if "Vertical" in st.session_state['orientation']:
-    Footprint_Area = (np.pi / 4.0) * (shell_od_m ** 2)
+    Footprint_Area = calc.get('Footprint_Area', (np.pi / 4.0) * (shell_od_m ** 2))
 else:
-    Footprint_Area = shell_od_m * Shell_TT_Length_m
+    Footprint_Area = calc.get('Footprint_Area', shell_od_m * Shell_TT_Length_m)
 
 with bbox_placeholder.container():
     st.markdown("#### 📐 실시간 장비 예상 규격 (Estimated Bounding Box)")
@@ -677,7 +959,7 @@ with bbox_placeholder.container():
 # =========================================================
 st.markdown("---")
 st.subheader("5. 열전달 및 수력학 검증 (Datasheet & Report)")
-st.caption(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Generated on: {calc.get('generated_at', 'N/A')}")
 
 with st.expander("💡 설계 유속(Velocity) 가이드라인 및 판정 기준"):
     st.markdown("""
@@ -686,9 +968,6 @@ with st.expander("💡 설계 유속(Velocity) 가이드라인 및 판정 기준
     | **Tube 측 (액체)** | 1.0 ~ 2.5 m/s | **< 1.0:** 침전물/오염 유발 <br> **> 3.0:** Tube 침식(Erosion) 및 파열 |
     | **Shell 측 (액체)** | 0.3 ~ 1.0 m/s | **< 0.2:** 열전달 사각지대 발생 <br> **> 1.5:** 유체 유발 진동(FIV)으로 코일 파손 |
     """)
-
-if penalty_factor < 1.0:
-    st.warning(f"⚠️ **코일 밀착 페널티 적용됨:** Pitch가 기준치({PITCH_RATIO_REF}*OD)보다 작아 코일 틈새 사각지대 현상을 반영했습니다. Shell 측 열전달 계수(h_o)가 {(1.0-penalty_factor)*100:.0f}% 삭감되었습니다.")
 
 # --- 색상 코딩된 Metric 카드 (Priority 4) ---
 st.markdown("#### 📊 핵심 성능 지표 (Key Performance Indicators)")
@@ -773,6 +1052,7 @@ html_report = f"""
 <head>
     <meta charset="UTF-8">
     <title>{st.session_state['tag_no']} - Heat Exchanger Datasheet</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; line-height: 1.6; margin: 20px; }}
         .header {{ text-align: center; border-bottom: 3px solid #004488; padding-bottom: 10px; margin-bottom: 30px; }}
@@ -804,7 +1084,7 @@ html_report = f"""
         <tr><td class="section-title" colspan="4">1. General Information</td></tr>
         <tr><th>Item Tag No.</th><td><b>{st.session_state['tag_no']}</b></td><th>Overall U-value</th><td>{U_calc:,.1f} W/m²K</td></tr>
         <tr><th>Heat Duty</th><td>{Q_kW:,.2f} kW</td><th>Req. / Design Area</th><td>{Area_req:,.2f} / <b>{Area_design:,.2f} m²</b> (+{st.session_state['overdesign_pct']}%)</td></tr>
-        <tr><th>LMTD</th><td>{LMTD:,.1f} &deg;C</td><th>Operation Mode</th><td>{op_mode}</td></tr>
+        <tr><th>LMTD</th><td>{values.get('LMTD', 1.0):,.1f} &deg;C</td><th>Operation Mode</th><td>{values.get('op_mode', 'N/A')}</td></tr>
         
         <tr><td class="section-title" colspan="4">2. Process Conditions</td></tr>
         <tr><th>Parameter</th><th colspan="1">Tube Side (Inner)</th><th colspan="2">Shell Side (Outer)</th></tr>
@@ -826,32 +1106,25 @@ html_report = f"""
         <tr><th>[Shell] ID / Mandrel OD</th><td>{st.session_state['D_s']} mm / {st.session_state['D_mandrel']} mm</td><th>[Shell] OD x Thick. (mm)</th><td>{shell_od:.1f} x {st.session_state['shell_thick']:.0f}</td></tr>
         <tr><th>[Shell] T/T Length (mm)</th><td colspan="3" style="font-size:16px;"><b>{Shell_TT_Length_mm:,.0f} mm</b></td></tr>
     </table>
+    
+    <h3 style="color:#004488; border-bottom:2px solid #004488; padding-bottom:5px;">4. Engineering Drawings</h3>
+    <h4>Cross-Section (횡단면도)</h4>
+    {_ds_cs_html}
+    <h4>Longitudinal Section (종단면도)</h4>
+    {_ds_ls_html}
 </body>
 </html>
 """
 
 col_dl1, col_dl2 = st.columns([1, 2])
 with col_dl1:
-    st.download_button(label="📄 Datasheet 다운로드 (HTML/PDF용)", data=html_report, file_name=f"{st.session_state['tag_no']}_Datasheet.html", mime="text/html")
+    st.download_button(label="📄 Datasheet 다운로드 (HTML/PDF용)", data=html_report, file_name=f"{st.session_state['tag_no']}_Datasheet.html", mime="text/html", disabled=not calc_result.is_valid)
 with col_dl2:
     st.info("💡 폰트 에러 없는 PDF 출력을 위해 HTML로 내보냅니다. 브라우저 인쇄(Ctrl+P) 기능을 활용하세요.")
 
-err_msg = []
-if lmtd_error: err_msg.append("Temperature Cross (온도 역전) 발생")
-if inner_clearance_rad < 0: err_msg.append("Mandrel - Coil 내측 간섭 발생")
-if outer_clearance_rad < 0: err_msg.append("Shell - Coil 외측 간섭 발생")
-if dp_tube_bar > st.session_state['allowable_dp_tube']: err_msg.append(f"Tube 측 ΔP 초과")
-if dp_shell_bar > st.session_state['allowable_dp_shell']: err_msg.append(f"Shell 측 ΔP 초과")
-if Shell_TT_Length_m > MAX_EQUIPMENT_LENGTH_M: err_msg.append(f"장비 총 길이 {MAX_EQUIPMENT_LENGTH_M:.0f}m 초과 (레이아웃 한계)")
-if d_i <= 0: err_msg.append("내경(ID) 계산 불가")
-
-if v_tube < V_TUBE_LOW: err_msg.append("Tube 유속 저하 (오염/침전 위험)")
-if v_tube > V_TUBE_HIGH: err_msg.append("Tube 유속 초과 (침식 위험)")
-if v_shell < V_SHELL_LOW: err_msg.append("Shell 유속 저하 (열전달 사각지대 위험)")
-if v_shell > V_SHELL_HIGH: err_msg.append("Shell 유속 초과 (진동/파손 위험)")
-
-if err_msg:
-    st.error("🚨 **Datasheet Warning:** " + " / ".join(err_msg))
+all_messages = calc_result.errors + calc_result.warnings
+if all_messages:
+    st.error("🚨 **Datasheet Review Required:** " + " / ".join(all_messages))
 else:
     st.success("✅ **Datasheet Validated:** 모든 공정, 수력학, 기계적 제약 조건을 통과했습니다.")
 
@@ -861,7 +1134,7 @@ else:
 st.markdown("---")
 st.subheader("6. 3D 코일 형상 (Schematic Representation)")
 
-if Turns_per_Tube > 0 and Turns_per_Tube < 2000 and d_i > 0 and not lmtd_error:
+if calc_result.is_valid and Turns_per_Tube > 0 and Turns_per_Tube < 2000 and d_i > 0:
     fig = go.Figure()
     
     t_max_full = Turns_per_Tube * 2 * np.pi
